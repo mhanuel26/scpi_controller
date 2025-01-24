@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2021 WIZnet Co.,Ltd
+ * Copyright (c) 2022 WIZnet Co.,Ltd
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -10,6 +10,12 @@
  * ----------------------------------------------------------------------------------------------------
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
 
 #include "port_common.h"
 
@@ -26,6 +32,13 @@
  * Macros
  * ----------------------------------------------------------------------------------------------------
  */
+/* Task */
+#define DHCP_TASK_STACK_SIZE 2048
+#define DHCP_TASK_PRIORITY 8
+
+#define DNS_TASK_STACK_SIZE 512
+#define DNS_TASK_PRIORITY 10
+
 /* Clock */
 #define PLL_SYS_KHZ (133 * 1000)
 
@@ -34,7 +47,7 @@
 
 /* Socket */
 #define SOCKET_DHCP 0
-#define SOCKET_DNS 1
+#define SOCKET_DNS 3
 
 /* Retry count */
 #define DHCP_RETRY_COUNT 5
@@ -49,15 +62,15 @@
 static wiz_NetInfo g_net_info =
     {
         .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x56}, // MAC address
-        .ip = {192, 168, 68, 99},                     // IP address
+        .ip = {192, 168, 11, 2},                     // IP address
         .sn = {255, 255, 255, 0},                    // Subnet Mask
-        .gw = {192, 168, 68, 1},                     // Gateway
+        .gw = {192, 168, 11, 1},                     // Gateway
         .dns = {8, 8, 8, 8},                         // DNS server
         .dhcp = NETINFO_DHCP                         // DHCP enable/disable
 };
 static uint8_t g_ethernet_buf[ETHERNET_BUF_MAX_SIZE] = {
     0,
-}; // common buffer
+};
 
 /* DHCP */
 static uint8_t g_dhcp_get_ip_flag = 0;
@@ -67,16 +80,23 @@ static uint8_t g_dns_target_domain[] = "www.wiznet.io";
 static uint8_t g_dns_target_ip[4] = {
     0,
 };
-static uint8_t g_dns_get_ip_flag = 1;
+static uint8_t g_dns_get_ip_flag = 0;
 
-/* Timer */
-static volatile uint16_t g_msec_cnt = 0;
+/* Semaphore */
+static xSemaphoreHandle dns_sem = NULL;
+
+/* Timer  */
+static volatile uint32_t g_msec_cnt = 0;
 
 /**
  * ----------------------------------------------------------------------------------------------------
  * Functions
  * ----------------------------------------------------------------------------------------------------
  */
+/* Task */
+void dhcp_task(void *argument);
+void dns_task(void *argument);
+
 /* Clock */
 static void set_clock_khz(void);
 
@@ -85,7 +105,7 @@ static void wizchip_dhcp_init(void);
 static void wizchip_dhcp_assign(void);
 static void wizchip_dhcp_conflict(void);
 
-/* Timer */
+/* Timer  */
 static void repeating_timer_callback(void);
 
 /**
@@ -96,10 +116,6 @@ static void repeating_timer_callback(void);
 int main()
 {
     /* Initialize */
-    uint8_t retval = 0;
-    uint8_t dhcp_retry = 0;
-    uint8_t dns_retry = 0;
-
     set_clock_khz();
 
     stdio_init_all();
@@ -113,6 +129,32 @@ int main()
 
     wizchip_1ms_timer_initialize(repeating_timer_callback);
 
+    xTaskCreate(dhcp_task, "DHCP_Task", DHCP_TASK_STACK_SIZE, NULL, DHCP_TASK_PRIORITY, NULL);
+    xTaskCreate(dns_task, "DNS_Task", DNS_TASK_STACK_SIZE, NULL, DNS_TASK_PRIORITY, NULL);
+
+    dns_sem = xSemaphoreCreateCounting((unsigned portBASE_TYPE)0x7fffffff, (unsigned portBASE_TYPE)0);
+
+    vTaskStartScheduler();
+
+    while (1)
+    {
+        ;
+    }
+}
+
+/**
+ * ----------------------------------------------------------------------------------------------------
+ * Functions
+ * ----------------------------------------------------------------------------------------------------
+ */
+/* Task */
+void dhcp_task(void *argument)
+{
+    int retval = 0;
+    uint8_t link;
+    uint16_t len = 0;
+    uint32_t dhcp_retry = 0;
+
     if (g_net_info.dhcp == NETINFO_DHCP) // DHCP
     {
         wizchip_dhcp_init();
@@ -123,95 +165,125 @@ int main()
 
         /* Get network information */
         print_network_information(g_net_info);
+
+        while (1)
+        {
+            vTaskDelay(1000 * 1000);
+        }
     }
 
-    DNS_init(SOCKET_DNS, g_ethernet_buf);
-
-    /* Infinite loop */
     while (1)
     {
-        /* Assigned IP through DHCP */
-        if (g_net_info.dhcp == NETINFO_DHCP)
+        link = wizphy_getphylink();
+
+        if (link == PHY_LINK_OFF)
         {
-            retval = DHCP_run();
+            printf("PHY_LINK_OFF\n");
 
-            if (retval == DHCP_IP_LEASED)
-            {
-                if (g_dhcp_get_ip_flag == 0)
-                {
-                    printf(" DHCP success\n");
+            DHCP_stop();
 
-                    g_dhcp_get_ip_flag = 1;
-                }
-            }
-            else if (retval == DHCP_FAILED)
-            {
-                g_dhcp_get_ip_flag = 0;
-                dhcp_retry++;
-
-                if (dhcp_retry <= DHCP_RETRY_COUNT)
-                {
-                    printf(" DHCP timeout occurred and retry %d\n", dhcp_retry);
-                }
-            }
-
-            if (dhcp_retry > DHCP_RETRY_COUNT)
-            {
-                printf(" DHCP failed\n");
-
-                DHCP_stop();
-
-                while (1)
-                    ;
-            }
-
-            wizchip_delay_ms(1000); // wait for 1 second
-        }
-
-        /* Get IP through DNS */
-        if ((g_dns_get_ip_flag == 0) && (retval == DHCP_IP_LEASED))
-        {
             while (1)
             {
-                if (DNS_run(g_net_info.dns, g_dns_target_domain, g_dns_target_ip) > 0)
-                {
-                    printf(" DNS success\n");
-                    printf(" Target domain : %s\n", g_dns_target_domain);
-                    printf(" IP of target domain : %d.%d.%d.%d\n", g_dns_target_ip[0], g_dns_target_ip[1], g_dns_target_ip[2], g_dns_target_ip[3]);
+                link = wizphy_getphylink();
 
-                    g_dns_get_ip_flag = 1;
+                if (link == PHY_LINK_ON)
+                {
+                    wizchip_dhcp_init();
+
+                    dhcp_retry = 0;
 
                     break;
                 }
-                else
-                {
-                    dns_retry++;
 
-                    if (dns_retry <= DNS_RETRY_COUNT)
-                    {
-                        printf(" DNS timeout occurred and retry %d\n", dns_retry);
-                    }
-                }
-
-                if (dns_retry > DNS_RETRY_COUNT)
-                {
-                    printf(" DNS failed\n");
-
-                    while (1)
-                        ;
-                }
-
-                wizchip_delay_ms(1000); // wait for 1 second
+                vTaskDelay(1000);
             }
+        }
+
+        retval = DHCP_run();
+
+        if (retval == DHCP_IP_LEASED)
+        {
+            if (g_dhcp_get_ip_flag == 0)
+            {
+                dhcp_retry = 0;
+
+                printf(" DHCP success\n");
+
+                g_dhcp_get_ip_flag = 1;
+
+                xSemaphoreGive(dns_sem);
+            }
+        }
+        else if (retval == DHCP_FAILED)
+        {
+            g_dhcp_get_ip_flag = 0;
+            dhcp_retry++;
+
+            if (dhcp_retry <= DHCP_RETRY_COUNT)
+            {
+                printf(" DHCP timeout occurred and retry %d\n", dhcp_retry);
+            }
+        }
+
+        if (dhcp_retry > DHCP_RETRY_COUNT)
+        {
+            printf(" DHCP failed\n");
+
+            DHCP_stop();
+
+            while (1)
+            {
+                vTaskDelay(1000 * 1000);
+            }
+        }
+
+        vTaskDelay(10);
+    }
+}
+
+void dns_task(void *argument)
+{
+    uint8_t dns_retry;
+
+    while (1)
+    {
+        xSemaphoreTake(dns_sem, portMAX_DELAY);
+        DNS_init(SOCKET_DNS, g_ethernet_buf);
+
+        dns_retry = 0;
+
+        while (1)
+        {
+            if (DNS_run(g_net_info.dns, g_dns_target_domain, g_dns_target_ip) > 0)
+            {
+                printf(" DNS success\n");
+                printf(" Target domain : %s\n", g_dns_target_domain);
+                printf(" IP of target domain : %d.%d.%d.%d\n", g_dns_target_ip[0], g_dns_target_ip[1], g_dns_target_ip[2], g_dns_target_ip[3]);
+
+                break;
+            }
+            else
+            {
+                dns_retry++;
+
+                if (dns_retry <= DNS_RETRY_COUNT)
+                {
+                    printf(" DNS timeout occurred and retry %d\n", dns_retry);
+                }
+            }
+
+            if (dns_retry > DNS_RETRY_COUNT)
+            {
+                printf(" DNS failed\n");
+
+                break;
+            }
+
+            vTaskDelay(10);
         }
     }
 }
 
-/**
- * ----------------------------------------------------------------------------------------------------
- * Functions
- * ----------------------------------------------------------------------------------------------------
- */
 /* Clock */
 static void set_clock_khz(void)
 {
@@ -236,6 +308,8 @@ static void wizchip_dhcp_init(void)
     DHCP_init(SOCKET_DHCP, g_ethernet_buf);
 
     reg_dhcp_cbfunc(wizchip_dhcp_assign, wizchip_dhcp_assign, wizchip_dhcp_conflict);
+
+    g_dhcp_get_ip_flag = 0;
 }
 
 static void wizchip_dhcp_assign(void)
@@ -260,7 +334,9 @@ static void wizchip_dhcp_conflict(void)
 
     // halt or reset or any...
     while (1)
-        ; // this example is halt.
+    {
+        vTaskDelay(1000 * 1000);
+    }
 }
 
 /* Timer */
