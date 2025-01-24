@@ -23,10 +23,11 @@
 
 
 
-
+#if LIB_PICO_STDIO_UART
 uint8_t rxChar;
-
-
+#elif LIB_PICO_STDIO_USB
+int rxChar;
+#endif
 
 /******************************************************************************
  * Function Name: uart_task
@@ -185,12 +186,14 @@ void uart_task(void *pvParameters) {
     while (true) {
         vTaskDelay((uint32_t)(50 / portTICK_PERIOD_MS)); // sleep 50 ms
         bHasChar = true;
-        while (bHasChar) {
+        while (bHasChar) { 
             rxChar = getchar_timeout_us(0); // don't wait for characters
-            if (rxChar == 255) {
-                bHasChar = false;
-            } else {
-                scpi_instrument_input((const char *)&rxChar, 1);
+            if(rxChar != PICO_ERROR_TIMEOUT){
+                if (rxChar == 255) {
+                    bHasChar = false;
+                } else {
+                    scpi_instrument_input((const char *)&rxChar, 1);
+                }
             }
         }
     }

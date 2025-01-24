@@ -81,21 +81,12 @@ set(FREERTOS_KERNEL_PATH "../libraries/FreeRTOS-Kernel")
 include(FreeRTOS_Kernel_import.cmake)
 # Set project informations
 project(${PROJECT_NAME} C CXX ASM)
-# project(WIZNET-PICO-C C CXX ASM)
-
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-
-
-
 # Initialize the SDK
 pico_sdk_init()
-
-
-
-
 
 # Set the project root directory if it's not already defined, as may happen if
 # the tests folder is included directly by a parent project, without including
